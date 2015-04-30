@@ -1,0 +1,26 @@
+=== Client Log ===
+[165183809] 50 MB sent @ 0 mb/s
+[165555495] 100 MB sent @ 0 mb/s
+[165704831] 150 MB sent @ 0 mb/s
+[165726211] 200 MB sent @ 0 mb/s
+[165742366] 250 MB sent @ 0 mb/s
+[165854418] 300 MB sent @ 0 mb/s
+[165755793] 350 MB sent @ 0 mb/s
+[165474214] 400 MB sent @ 0 mb/s
+[165594539] 450 MB sent @ 0 mb/s
+[165327351] 500 MB sent @ 0 mb/s
+No response from server, terminating.
+
+
+=== Server Log ===
+[165184989] 56 MB sent @ 0 mb/s
+[165555285] 106 MB sent @ 0 mb/s
+[165704603] 156 MB sent @ 0 mb/s
+[165726715] 206 MB sent @ 0 mb/s
+[165742085] 256 MB sent @ 0 mb/s
+[165854445] 306 MB sent @ 0 mb/s
+[165754995] 356 MB sent @ 0 mb/s
+[165474591] 406 MB sent @ 0 mb/s
+[165594646] 456 MB sent @ 0 mb/s
+[165327525] 506 MB sent @ 0 mb/s
+File send completed(timeout) in 1736.36 seconds. Average transfer rate for 530 MB was 0 mb/s.

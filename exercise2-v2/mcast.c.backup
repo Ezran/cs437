@@ -1,0 +1,390 @@
+#include "net_include.h"
+#include "packet.h"
+#include "recv_dbg.h"
+#include "circlearray.h"
+
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <time.h>
+
+#define EMPTY_TOKEN_SIZE 8*sizeof(int)
+#define FLOW_CONTROL     50
+#define CQ_CAP           1000
+
+int main(int argc, char* argv[]) {
+
+    char               f_name[80];
+    FILE *             fp;
+
+    struct sockaddr_in name;
+    struct sockaddr_in send_addr;
+    struct sockaddr_in next_addr;
+    struct ifaddrs*    addrs;
+    struct ifaddrs*    tmp;
+
+    struct timeval*    timeout;
+    struct ip_mreq     mreq;
+    unsigned char      ttl_val;
+    unsigned char      loop;
+
+    int                ss,sr;
+    fd_set             mask;
+    fd_set             dummy_mask,temp_mask;
+    int                bytes;                                   //check bytes > 0 from recv_dbg, otherwise packet was 'dropped'
+    int                num;
+    char               mess_buf[MAX_PAYLOAD_LEN];
+    int                my_id;
+    int                next_p;                                  //next process in the token ring
+    int*               ip_list;
+    int                total_packets;
+    int                packets_to_send;
+    int                seq;
+    int                aru;
+    token *            old_token;
+    int                saved_dec_aru;
+    int                token_retries;
+
+    srand(time(NULL));
+    /* command line args */
+    if (argc < 5){
+        printf("Useage: mcast <num_packets> <machine_index> <number of machines> <loss rate>\n");
+        return 0;
+    }
+    token_retries = 0;
+    total_packets = atoi(argv[1]);
+    packets_to_send = total_packets;
+    my_id = atoi(argv[2]);
+    if (my_id == atoi(argv[3]))
+        next_p = 1; 
+    else 
+        next_p = my_id + 1; 
+    recv_dbg_init(atoi(argv[4]), my_id);
+
+    /* Initialize variables */
+    seq = -1;
+    aru = 0;
+    saved_dec_aru = -1;
+    ip_list = malloc(sizeof(int)*atoi(argv[3]));
+    timeout = NULL;
+
+    strcat(f_name,argv[2]);
+    strcat(f_name,".out");
+    printf("Writing to %s\n",f_name);
+    fp = fopen(f_name, "w");
+
+    /* Get my IP address */
+    getifaddrs(&addrs);
+    tmp = addrs;
+    while (tmp) {
+        if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET && strcmp(tmp->ifa_name,"eth0") == 0){
+            struct sockaddr_in *pAddr = (struct sockaddr_in *)tmp->ifa_addr;
+            printf("My IP (%s): [%x] <%s>\n", tmp->ifa_name, pAddr->sin_addr, inet_ntoa(pAddr->sin_addr));
+            ip_list[my_id-1] = (int)pAddr->sin_addr.s_addr;
+        }
+        tmp = tmp->ifa_next;
+    }
+    freeifaddrs(addrs);
+
+    /* receiving socket */
+    sr = socket(AF_INET, SOCK_DGRAM, 0); 
+    if (sr<0) {
+        perror("Mcast: socket");
+        exit(1);
+    }
+
+    name.sin_family = AF_INET;
+    name.sin_addr.s_addr = INADDR_ANY;
+    name.sin_port = htons(PORT);
+
+    if ( bind( sr, (struct sockaddr *)&name, sizeof(name) ) < 0 ) {
+        perror("Mcast: bind");
+        exit(1);
+    }
+
+    mreq.imr_multiaddr.s_addr = htonl( IPADDR );
+    mreq.imr_interface.s_addr = htonl( INADDR_ANY );
+
+    if (setsockopt(sr, IPPROTO_IP, IP_ADD_MEMBERSHIP, (void *)&mreq, 
+        sizeof(mreq)) < 0) 
+    {
+        perror("Mcast: problem in setsockopt to join multicast address" );
+    }
+
+    /* sending socket */
+    ss = socket(AF_INET, SOCK_DGRAM, 0); 
+    if (ss<0) {
+        perror("Mcast: socket");
+        exit(1);
+    }
+
+    ttl_val = 1;
+    loop = 0;
+    if (setsockopt(ss, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop)) < 0)
+        printf("Mcast: problem in setsockopt of multicast loopback\n");
+
+    if (setsockopt(ss, IPPROTO_IP, IP_MULTICAST_TTL, (void *)&ttl_val, 
+        sizeof(ttl_val)) < 0) 
+    {
+        printf("Mcast: problem in setsockopt of multicast ttl %d - ignore in WinNT or Win95\n", ttl_val );
+    }
+
+    send_addr.sin_family = AF_INET;
+    send_addr.sin_addr.s_addr = htonl(IPADDR);  /* mcast address */
+    send_addr.sin_port = htons(PORT);
+
+    next_addr.sin_family = AF_INET;
+    next_addr.sin_addr.s_addr = ip_list[next_p-1];
+    next_addr.sin_port = htons(PORT);
+
+    /* set up file descriptor masks */
+    FD_ZERO( &mask );
+    FD_ZERO( &dummy_mask );
+    FD_SET( sr, &mask );
+
+
+    printf("Waiting for start_mcast...\n");
+
+    /* Init Phase */
+    int init_state = 0;
+    while(init_state < 2)
+    {
+        temp_mask = mask;
+        num = select( FD_SETSIZE, &temp_mask, &dummy_mask, &dummy_mask, timeout);
+        if (num > 0 && FD_ISSET( sr, &temp_mask)) {
+            if (init_state == 0) {
+                recv(sr, mess_buf, MAX_PAYLOAD_LEN, 0);
+                memcpy(&num,mess_buf,sizeof(int));
+                if (num == 1) {                                      //type is init packet
+                    printf("Received start_mcast\n");
+                    init_state = 1;
+                    timeout = malloc(sizeof(struct timeval));
+                    timeout->tv_sec = 0;
+                    timeout->tv_usec = 10000;
+                    if (my_id == 1) {                                       // process 1 creates token         
+                        token * tok = malloc(sizeof(token));
+                        tok->type = 2;
+                        tok->src_p = 1;
+                        tok->src_ip = ip_list[my_id-1];
+                        tok->round = 1;
+                        tok->seq = 0;
+                        tok->aru = 0;
+                        tok->rtr_len = atoi(argv[3]);
+                        memcpy(tok->rtr, ip_list, atoi(argv[3]));
+
+                        old_token = tok;
+                        seq = 0; 
+                    } 
+                }
+            }
+            else if (init_state == 1) {
+                bytes = recv_dbg(sr, mess_buf, MAX_PAYLOAD_LEN, 0);
+                if (bytes > 0) {
+                    memcpy(&num,mess_buf, sizeof(int));
+                    if (num == 1){
+                        initializer * packet = (initializer*)mess_buf;
+                        if (packet->src_p != my_id) {
+                            ip_list[packet->src_p - 1] = packet->src_ip;
+                            if (packet->src_p == next_p)
+                                next_addr.sin_addr.s_addr = ip_list[next_p-1];
+                        }
+                    }
+                    else if(num == 2) {
+                        token * packet = (token*)mess_buf;
+                        for (int i = 0; i < packet->rtr_len; i++) {
+                                if (ip_list[i] == 0 && packet->rtr[i] > 0) {
+                                    printf("Adding %x to my ip_list\n",packet->rtr[i]);
+                                    ip_list[i] = packet->rtr[i];
+                                    if (i == next_p-1)
+                                        next_addr.sin_addr.s_addr = ip_list[next_p-1];
+                                }
+                        }                            
+
+                        if (packet->round == 1) { 
+                            if (my_id == 1) {
+                                free(old_token);
+                                old_token = malloc(EMPTY_TOKEN_SIZE);
+                                old_token->type = 2;
+                                old_token->src_p = my_id;
+                                old_token->src_ip = ip_list[my_id-1];
+                                old_token->round = 2;
+                                old_token->seq = 0;
+                                old_token->aru = 0;
+                                old_token->dec_aru_src = 0;
+                                old_token->rtr_len = 0;
+                            }
+                            else if (seq == -1){ 
+                                old_token = malloc(sizeof(token));
+                                memcpy(old_token, packet, EMPTY_TOKEN_SIZE + packet->rtr_len * sizeof(int));
+                                old_token->src_p = my_id;
+                                old_token->src_ip = ip_list[my_id-1];
+                                memcpy(old_token->rtr, ip_list, atoi(argv[3])*sizeof(int));
+                                seq = 0;
+                            }
+                            else {
+                                memcpy(old_token->rtr, ip_list, old_token->rtr_len * sizeof(int));
+                                sendto( ss, (char*)old_token, EMPTY_TOKEN_SIZE + old_token->rtr_len*sizeof(int), 0 , (struct sockaddr*)&next_addr, sizeof(next_addr));
+                            }   
+                        }
+                        else if ( old_token->round == 2 || packet->round == 2) {
+                            init_state = 2;
+                            if (my_id > 1 && old_token->round < packet->round) {
+                                free(old_token);
+                                old_token = malloc(sizeof(token));
+                                memcpy(old_token, packet, EMPTY_TOKEN_SIZE);
+                                old_token->src_p = my_id;
+                                old_token->src_ip = ip_list[my_id-1];
+                            }
+                            sendto( ss, (char*)old_token, EMPTY_TOKEN_SIZE + sizeof(int)*old_token->rtr_len, 0 , (struct sockaddr*)&next_addr, sizeof(next_addr));
+                        }
+                    } 
+                }
+            }           
+        }
+        else {
+            if (init_state == 1) {
+                // if i haven't seen token, send my stuff multicast
+                if (seq == -1) {
+                    initializer* packet = malloc(sizeof(initializer));
+                    packet->type = 1;
+                    packet->src_p = my_id;
+                    packet->src_ip = ip_list[my_id-1];
+
+                    sendto( ss, (char*)packet, sizeof(initializer), 0, (struct sockaddr*)&send_addr, sizeof(send_addr));
+                    free(packet); 
+                }
+                // if i have seen token, AND i have next guy's IP resend the token
+                else if (seq == 0 && ip_list[next_p-1] > 0) {
+                    memcpy(old_token->rtr, ip_list, old_token->rtr_len * sizeof(int));
+                    bytes = sendto( ss, (char*)old_token, EMPTY_TOKEN_SIZE + old_token->rtr_len*sizeof(int), 0 , (struct sockaddr*)&next_addr, sizeof(next_addr));
+               } 
+                // else do nothing, have no next_ip
+            }
+        }
+    }
+
+    printf("My ID is: %d\tNext ID is: %d\n",my_id,next_p);
+    return 0;
+    timeout->tv_usec = 100000;
+
+    /* Begin Transmit Phase */
+    for(;;) {
+        temp_mask = mask;
+        num = select( FD_SETSIZE, &temp_mask, &dummy_mask, &dummy_mask, timeout);
+        if (num > 0 && FD_ISSET( sr, &temp_mask)) {
+            if( recv_dbg(sr, mess_buf, MAX_PAYLOAD_LEN, 0) > 0 ) {
+                memcpy(&num,mess_buf, sizeof(int));
+                if (num == 2) {                                         //get a token
+                    token_retries = 0;
+                    token* packet = (token*)mess_buf;
+                    old_token->type = 2;
+
+                    int min_aru;
+                    if (packet->aru < old_token->aru)                              //generate min aru for writing
+                        min_aru = packet->aru;
+                    else
+                        min_aru = old_token->aru;
+
+                    if ( packet->seq >= seq ) {                         //check if token is new
+                        seq = packet->seq;
+                        if (my_id == 1)                                 // increment round
+                            old_token->round++;
+                        if ( aru < packet->aru || packet->dec_aru_src == my_id ) {     // raise token aru if i decremented it OR lower it if i'm the farthest behind
+                            printf("Lower ARU, I am behind (local %d token %d)\n",aru,packet->aru);
+                            old_token->aru = aru;
+                            old_token->dec_aru_src = my_id;
+                        }
+
+                        int *new_rtr = malloc(sizeof(int)*255);
+                        memset(new_rtr,0,255);
+
+                        int new_rtr_ind = 0;
+                        for (int i = 0; i < packet->rtr_len; i++) {     //retransmit any on rtr list
+                            pod* seek = ca_get_index(packet->rtr[i]);
+                            printf("Seeking to retransmit index %d.... \n",packet->rtr[i]);
+                            if (seek != NULL) {
+
+                                data* send = malloc(sizeof(data));
+                                send->type = 3;
+                                send->src_p = seek->machine_index;
+                                send->seq = seek->packet_index;
+                                send->rand = seek->random;
+        
+                                sendto( ss, (char*)send, sizeof(data), 0, (struct sockaddr*)&send_addr, sizeof(send_addr));
+                                free(send);
+                            }        
+                        }
+                        //insert my rtr requests
+                        int num_missing;
+                        int * rtr_req = ca_get_missing(&num_missing);
+                        if (num_missing > 255)
+                            num_missing = 255;
+                        for (int i = 0; i < num_missing; i++)
+                            old_token->rtr[i] = rtr_req[i];
+
+                        for (int i = 0; packets_to_send > 0 && i < FLOW_CONTROL; i++ && packets_to_send--) {                //send new packets if available                    
+                            printf("My seq %d aru %d before sending new packet\n",seq,aru);
+                            if (aru == seq) {
+                                old_token->dec_aru_src = -1;
+                                aru++;
+                            }         
+                            seq++;
+
+                            data * send = malloc(sizeof(data));
+                            send->type = 3;
+                            send->src_p = my_id;
+                            send->seq = seq;
+                            send->rand = rand() % 1000000 + 1;
+                            
+                            ca_insert(my_id, seq, send->rand);
+                            
+                            old_token->seq = seq;
+                            if (old_token->dec_aru_src == -1)
+                                old_token->aru = aru;          
+
+                            printf("Sending new data: %d <%d>, my info: seq %d aru %d start_ptr %d cq_len %d\n",send->seq,send->rand,seq,aru,-1,ca_get_size());
+                            sendto( ss, (char*)send, sizeof(data), 0, (struct sockaddr*)&send_addr, sizeof(send_addr));
+                        }
+
+                        old_token->src_p = my_id;
+                        old_token->src_ip = ip_list[my_id-1];
+                                                                                // pass token
+                        token_retries++;
+                        if (token_retries < 10){ printf("sending token... %d \n",token_retries);
+                            sendto(ss, (char*)old_token, EMPTY_TOKEN_SIZE + sizeof(int)*old_token->rtr_len, 0 , (struct sockaddr*)&next_addr, sizeof(next_addr));}
+
+                        if (ca_get_min() < old_token->aru) {
+                            pod* rm = ca_remove();
+                            while ( rm != NULL && ca_get_min() < old_token->aru ) {                   // write 
+                                printf("writing %2d, %8d, %8d\n",rm->machine_index, rm->packet_index, rm->random);
+                                fprintf(fp, "%2d, %8d, %8d\n",rm->machine_index, rm->packet_index, rm->random);
+                                free(rm);
+                                rm = ca_remove();
+                            }
+                        }
+                    }    
+                }
+                else if (num == 3) { //got a data
+                    data* packet = (data*)mess_buf;
+                    if ( packet->seq > seq ) {
+                        if (ca_get_size() == MAX_ARRAY_SIZE)                                   //if array is full, drop packet
+                            break;  
+                        seq = packet->seq;                                      // else if packet seq > local seq 
+                    }
+                    printf("got data: seq %d, start_ptr %d, cq_len %d\n",packet->seq,-1,ca_get_size());
+                    ca_insert(packet->src_p, packet->seq, packet->rand);
+                    }
+                }
+            }
+        else { 
+            if (token_retries < 10) {
+                printf("timeout, resending token %d\n",token_retries);
+                sendto( ss, (char*)old_token, EMPTY_TOKEN_SIZE + sizeof(int)*old_token->rtr_len, 0, (struct sockaddr*)&next_addr, sizeof(next_addr)); //token got lost, resend
+                token_retries++;
+            }
+        }
+    }
+    /* End Transmission Phase */
+
+
+    return 0;
+}

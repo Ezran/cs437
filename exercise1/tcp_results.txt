@@ -1,0 +1,11 @@
+[411976] 50 MB sent @ 968 mb/s
+[431204] 100 MB sent @ 920 mb/s
+[426995] 150 MB sent @ 936 mb/s
+[429963] 200 MB sent @ 928 mb/s
+[425142] 250 MB sent @ 936 mb/s
+[426460] 300 MB sent @ 936 mb/s
+[427337] 350 MB sent @ 936 mb/s
+[426762] 400 MB sent @ 936 mb/s
+[431427] 450 MB sent @ 920 mb/s
+[431938] 500 MB sent @ 920 mb/s
+File send completed in 4.48 seconds. Average transfer rate for 524 MB was 936 mb/s. 

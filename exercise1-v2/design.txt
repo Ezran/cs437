@@ -1,0 +1,23 @@
+Practical 1r2 Design
+
+Data Structures
+===============
+
+struct data {
+    int type; //1
+    int index;
+    int payload_len;
+    char* payload[1200 - 3*sizeof(int)];
+}
+
+struct ack {
+    int type; //2
+    int index;
+}
+
+struct finished {
+    int type; //3
+}
+
+Client and server maintain arrays to store packet index number, payload_len and payloads of size ARRAY_SIZE.
+When client receives an ack, it zeros those values and tries to move ack up.  Client refills arrays when 
